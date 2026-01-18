@@ -17,7 +17,7 @@
 
 #include "internal/work_stealing_deque.h"         // IWYU pragma: keep
 #include "internal/work_stealing_job.h"
-
+#include "internal/topology.h"
 // IWYU pragma: no_include <bits/chrono.h>
 // IWYU pragma: no_include <bits/this_thread_sleep.h>
 
@@ -114,11 +114,31 @@ struct scheduler {
         spawned_threads(),
         finished_flag(false) {
 
-    // Spawn num_threads many threads on startup
+    // 1. Build topology (executed only once)
+    topology.build(num_threads);
+    
+    // Optional: Print topology info for verification
+    // topology.print_info();
+
+    // 2. Pin the main thread
+    topology.pin_thread(0);
+    
+    // Initialize worker_info for the main thread
+    // Note: We can now look up the NUMA ID directly from the topology
+    int main_node = topology.worker_map[0].numa_node;
+    worker_info = {0, main_node, this};
+    parent_worker_info = std::move(worker_info);
+    worker_info = {0, main_node, this};
+
+    // 3. Start other threads
     for (worker_id_type i = 1; i < num_threads; ++i) {
       spawned_threads.emplace_back([&, i]() {
-        worker_info = {i, this};
-        worker();
+        // Pin child thread
+        topology.pin_thread(i);
+        
+        int my_node = topology.worker_map[i].numa_node;
+        worker_info = {i, my_node, this};
+        worker(); // Child threads enter the work loop immediately
       });
     }
   }
@@ -176,6 +196,8 @@ struct scheduler {
   struct alignas(128) attempt {
     size_t val;
   };
+
+  internal::Topology topology;
 
   int num_deques;
   std::atomic<size_t> num_awake_workers;
