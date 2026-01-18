@@ -63,17 +63,18 @@ struct scheduler {
     static constexpr worker_id_type UNINITIALIZED = std::numeric_limits<worker_id_type>::max();
 
     worker_id_type worker_id;
+    int my_numa_node;
     scheduler* my_scheduler;
 
     workerInfo() : worker_id(UNINITIALIZED), my_scheduler(nullptr) {}
-    workerInfo(std::size_t worker_id_, scheduler* s) : worker_id(worker_id_), my_scheduler(s) {}
-
+    workerInfo(std::size_t worker_id_, int my_numa_node_, scheduler* s) : worker_id(worker_id_), my_numa_node(my_numa_node_), my_scheduler(s) {}
     workerInfo& operator=(const workerInfo&) = delete;
     workerInfo(const workerInfo&) = delete;
 
     workerInfo& operator=(workerInfo&& w) noexcept {
       if (this != &w) {
         worker_id = std::exchange(w.worker_id, UNINITIALIZED);
+        my_numa_node = w.my_numa_node;
         my_scheduler = std::exchange(w.my_scheduler, nullptr);
       }
       return *this;
@@ -108,7 +109,7 @@ struct scheduler {
       : num_threads(num_workers),
         num_deques(num_threads),
         num_awake_workers(num_threads),
-        parent_worker_info(std::exchange(worker_info, workerInfo{0, this})),
+        parent_worker_info(std::exchange(worker_info, workerInfo{0, 0,this})),
         deques(num_deques),
         attempts(num_deques),
         spawned_threads(),
@@ -119,7 +120,7 @@ struct scheduler {
     
     // Optional: Print topology info for verification
     // topology.print_info();
-
+    root_job_slots = std::make_unique<RootJobSlot[]>(topology.num_numa_nodes);
     // 2. Pin the main thread
     topology.pin_thread(0);
     
@@ -198,7 +199,10 @@ struct scheduler {
   };
 
   internal::Topology topology;
-
+  struct alignas(64) RootJobSlot {
+    std::atomic<Job*> job{nullptr};
+  };
+  std::unique_ptr<RootJobSlot[]> root_job_slots;
   int num_deques;
   std::atomic<size_t> num_awake_workers;
   workerInfo parent_worker_info;
@@ -218,8 +222,25 @@ struct scheduler {
 #if PARLAY_ELASTIC_PARALLELISM
     wait_for_work();
 #endif
-    while (!finished()) {
-      Job* job = get_job([&]() { return finished(); }, PARLAY_ELASTIC_PARALLELISM);
+int my_node = worker_info.my_numa_node;
+while (!finished()) {
+      Job* job = nullptr;
+      // =========================================================
+      // 【新增】 Step 3: 优先检查 NUMA Root 信箱 (Take & Clear)
+      // =========================================================
+      // 1. 快速检查 (Relaxed load)
+      if (root_job_slots[my_node].job.load(std::memory_order_relaxed) != nullptr) {
+          // 2. 原子获取 (Acquire exchange)
+          job = root_job_slots[my_node].job.exchange(nullptr, std::memory_order_acquire);
+      }
+
+      // 如果信箱里没货（或者已经拿到了），走原有逻辑
+      if (job == nullptr) {
+          job = get_job([&]() { return finished(); }, PARLAY_ELASTIC_PARALLELISM);
+      }
+      // Job* job = get_job([&]() { return finished(); }, PARLAY_ELASTIC_PARALLELISM);
+      
+      
       if (job)(*job)();
 #if PARLAY_ELASTIC_PARALLELISM
       else if (!finished()) {
@@ -269,32 +290,116 @@ struct scheduler {
   // Returns nullptr if break_early() returns true before a job
   // is found, or, if timeout is true and it takes longer than
   // STEAL_TIMEOUT to find a job to steal.
+  // template<typename F>
+  // Job* steal_job(F&& break_early, bool timeout) {
+  //   size_t id = worker_id();
+  //   const auto start_time = std::chrono::steady_clock::now();
+  //   do {
+  //     // By coupon collector's problem, this should touch all.
+  //     for (size_t i = 0; i <= YIELD_FACTOR * num_deques; i++) {
+  //       if (break_early()) return nullptr;
+  //       Job* job = try_steal(id);
+  //       if (job) return job;
+  //     }
+  //     std::this_thread::sleep_for(std::chrono::nanoseconds(num_deques * 100));
+  //   } while (!timeout || std::chrono::steady_clock::now() - start_time < STEAL_TIMEOUT);
+  //   return nullptr;
+  // }
+
+// 【修正版】两阶段 Stealing 策略
   template<typename F>
   Job* steal_job(F&& break_early, bool timeout) {
-    size_t id = worker_id();
+    size_t worker_id = worker_info.worker_id;
+    int my_node = worker_info.my_numa_node;
+    
     const auto start_time = std::chrono::steady_clock::now();
+
+    auto& local_range = topology.numa_worker_ranges[my_node];
+    size_t local_size = local_range.second - local_range.first;
+    
+    // 预先计算好基于 ID 的 Base Hash，避免循环里重复算
+    // 这是每个人独有的“指纹”
+    size_t my_id_hash = hash(worker_id);
+
+    constexpr size_t LOCAL_TRIAL_FACTOR = 10;
+    // 设定尝试次数
+    size_t local_trials = (local_size > 0) ? local_size : 0; 
+    local_trials *= LOCAL_TRIAL_FACTOR;
+    size_t global_trials = num_deques; 
+    global_trials*= YIELD_FACTOR;
+
     do {
-      // By coupon collector's problem, this should touch all.
-      for (size_t i = 0; i <= YIELD_FACTOR * num_deques; i++) {
+      // =========================================================
+      // Phase 1: Local NUMA Stealing
+      // =========================================================
+      if (local_size > 1) { 
+          for (size_t i = 0; i < local_trials; i++) {
+            if (break_early()) return nullptr;
+
+            // 【回归原版算法】 Hash(ID) + Hash(Val)
+            // 保证每个人生成的随机序列是完全正交的，不会因为进度追赶而撞车
+            size_t step_hash = hash(attempts[worker_id].val);
+            attempts[worker_id].val++; 
+
+            // Offset 也要足够随机
+            size_t offset = (my_id_hash + step_hash) % local_size;
+            size_t target = local_range.first + offset;
+
+            if (target == worker_id) continue; 
+
+            // 注意：这里调用的是修改后(接受target参数)的 try_steal
+            Job* job = try_steal(target);
+            if (job) return job;
+          }
+      }
+
+      // =========================================================
+      // Phase 2: Global Stealing
+      // =========================================================
+      for (size_t i = 0; i < global_trials; i++) {
         if (break_early()) return nullptr;
-        Job* job = try_steal(id);
+
+        size_t step_hash = hash(attempts[worker_id].val);
+        attempts[worker_id].val++;
+
+        // 全局随机：直接模 num_deques
+        size_t target = (my_id_hash + step_hash) % num_deques;
+        
+        if (target == worker_id) continue;
+
+        Job* job = try_steal(target);
         if (job) return job;
       }
+
+      // =========================================================
+      // Sleep Strategy
+      // =========================================================
       std::this_thread::sleep_for(std::chrono::nanoseconds(num_deques * 100));
+
     } while (!timeout || std::chrono::steady_clock::now() - start_time < STEAL_TIMEOUT);
+    
     return nullptr;
   }
-
-  Job* try_steal(size_t id) {
-    // use hashing to get "random" target
-    size_t target = (hash(id) + hash(attempts[id].val)) % num_deques;
-    attempts[id].val++;
+// 必须配合修改 try_steal
+  Job* try_steal(size_t target) {
+    // 这里的 target 是外面算好的，这里只管偷
     auto [job, empty] = deques[target].pop_top();
 #if PARLAY_ELASTIC_PARALLELISM
     if (!empty) wake_up_a_worker();
 #endif
     return job;
   }
+
+//   Job* try_steal(size_t id) {
+//     // use hashing to get "random" target
+//     size_t target = (hash(id) + hash(attempts[id].val)) % num_deques;
+//     attempts[id].val++;
+//     auto [job, empty] = deques[target].pop_top();
+// #if PARLAY_ELASTIC_PARALLELISM
+//     if (!empty) wake_up_a_worker();
+// #endif
+//     return job;
+//   }
 
 #if PARLAY_ELASTIC_PARALLELISM
 
@@ -352,9 +457,69 @@ struct scheduler {
 class fork_join_scheduler {
   using Job = WorkStealingJob;
   using scheduler_t = scheduler<Job>;
-
+struct OwningJob : WorkStealingJob {
+    std::function<void()> func;
+    OwningJob(std::function<void()> f) : func(std::move(f)) {}
+    void execute() override { func(); }
+  };
  public:
+template <typename F>
+  static void numa_aware_parfor(scheduler_t& scheduler, size_t start, size_t end, F&& f, size_t granularity = 0) {
+    if (end <= start) return;
+    
+    // 如果只有一个 NUMA 节点，直接回退到普通 parfor
+    if (scheduler.topology.num_numa_nodes <= 1) {
+        parfor(scheduler, start, end, std::forward<F>(f), granularity);
+        return;
+    }
 
+    size_t nodes = scheduler.topology.num_numa_nodes;
+    size_t chunk_size = (end - start) / nodes;
+    
+    // 使用 unique_ptr 管理生命周期
+    std::vector<std::unique_ptr<OwningJob>> root_jobs;
+    root_jobs.reserve(nodes);
+
+    for (size_t i = 0; i < nodes; ++i) {
+      size_t c_start = start + i * chunk_size;
+      size_t c_end = (i == nodes - 1) ? end : (c_start + chunk_size);
+      
+      if (c_start >= c_end) {
+          root_jobs.push_back(nullptr);
+          continue;
+      }
+
+      // 构造闭包，内部调用 parfor_
+      auto task_lambda = [&scheduler, c_start, c_end, &f, granularity]() {
+          parfor_(scheduler, c_start, c_end, f, granularity, false);
+      };
+
+      auto job_ptr = std::make_unique<OwningJob>(std::move(task_lambda));
+      
+      // 投递到信箱
+      scheduler.root_job_slots[i].job.store(job_ptr.get(), std::memory_order_release);
+      root_jobs.push_back(std::move(job_ptr));
+    }
+
+    // 唤醒所有 Worker
+    scheduler.wake_up_all_workers();
+
+    // 主线程阻塞等待所有 Root Job 完成
+    auto all_done = [&]() {
+      for (const auto& job : root_jobs) {
+        if (job && !job->finished()) return false;
+      }
+      return true;
+    };
+    
+    // 主线程参与 Stealing 直到完成
+    scheduler.do_work_until(all_done);
+
+    // 清理信箱指针 (防悬垂)
+    for (size_t i = 0; i < nodes; ++i) {
+      scheduler.root_job_slots[i].job.store(nullptr, std::memory_order_relaxed);
+    }
+  }
   // Fork two thunks and wait until they both finish.
   template <typename L, typename R>
   static void pardo(scheduler_t& scheduler, L&& left, R&& right, bool conservative = false) {

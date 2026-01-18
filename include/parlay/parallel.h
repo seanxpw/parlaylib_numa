@@ -204,6 +204,30 @@ inline void parallel_for(size_t start, size_t end, F&& f, long granularity, bool
   }
 }
 
+template <typename F>
+inline void numa_aware_parallel_for(size_t start, size_t end, F&& f, size_t granularity = 0) {
+    // 1. [一致性] 类型检查，确保 f(i) 可调用
+    static_assert(std::is_invocable_v<F&, size_t>);
+
+    // 2. [一致性] 单个元素直接执行，不走调度开销
+    if (start + 1 == end) {
+        f(start);
+    }
+    // 3. [一致性] 小于粒度阈值，直接当前线程串行循环
+    // 注意：如果 granularity 为 0，这个条件通常不成立，会落入下面的调度器逻辑（符合预期）
+    else if (granularity > 0 && (end - start) <= granularity) {
+        for (size_t i = start; i < end; i++) f(i);
+    }
+    // 4. [一致性] 真正需要并行时才调用 Scheduler
+    else if (end > start) {
+        fork_join_scheduler::numa_aware_parfor(
+            internal::get_current_scheduler(), // 获取单例
+            start, end, 
+            std::forward<F>(f), 
+            granularity
+        );
+    }
+}
 template <typename Lf, typename Rf>
 inline void par_do(Lf&& left, Rf&& right, bool conservative) {
   static_assert(std::is_invocable_v<Lf&&>);
