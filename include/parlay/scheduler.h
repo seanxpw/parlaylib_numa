@@ -217,61 +217,62 @@ struct scheduler {
   std::atomic<size_t> num_finished_workers{0};
 
   // Start an individual worker task, stealing work if no local
-  // work is available. May go to sleep if no work is available
-  // for a long time, until woken up again when notified that
-  // new work is available.
-  void worker() {
+// work is available. May go to sleep if no work is available
+// for a long time, until woken up again when notified that
+// new work is available.
+void worker() {
 #if PARLAY_ELASTIC_PARALLELISM
-    wait_for_work();
+  wait_for_work();
 #endif
-int my_node = worker_info.my_numa_node;
-while (!finished()) {
-      Job* job = nullptr;
-      // printf("Worker %u (NUMA Node %d) checking root job slot...\n", worker_info.worker_id, my_node);
-      // =========================================================
-      // 【新增】 Step 3: 优先检查 NUMA Root 信箱 (Take & Clear)
-      // =========================================================
-      // 1. 快速检查 (Relaxed load)
-      if (root_job_slots[my_node].job.load(std::memory_order_relaxed) != nullptr) {
-          // 2. 原子获取 (Acquire exchange)
-          job = root_job_slots[my_node].job.exchange(nullptr, std::memory_order_acquire);
-      }
-      // 这里的 counter 是局部变量，Lambda 需要 mutable 才能修改它
-int loop_counter = 0; 
 
-auto break_condition = [&, loop_counter]() mutable {
-    // 1. 每次都检查全局结束标志 (finished通常实现很轻)
-    if (finished()) return true;
+  int my_node = worker_info.my_numa_node;
 
-    // 2. 采样检查：每 64 次循环才去读一次原子变量
-    // 使用位运算 (counter & 63) 比取模 (% 64) 快得多
-    if ((++loop_counter & 63) == 0) {
-        // 只有这里才会产生 load 开销
-        return root_job_slots[my_node].job.load(std::memory_order_relaxed) != nullptr;
+  // 小工具：尝试从本 NUMA mailbox 取一个 job
+  auto try_take_mailbox = [&]() -> Job* {
+    auto& slot = root_job_slots[my_node].job;
+    // 快速路径：绝大多数时间 mailbox 为空，避免 RMW
+    if (slot.load(std::memory_order_relaxed) == nullptr) return nullptr;
+    // 非空才 exchange（RMW，用 acq_rel）
+    return slot.exchange(nullptr, std::memory_order_acq_rel);
+  };
+
+  while (!finished()) {
+    Job* job = nullptr;
+
+    // =========================================================
+    // Step 1: 优先检查 NUMA Root mailbox (Take & Clear)
+    // =========================================================
+    job = try_take_mailbox();
+
+    // =========================================================
+    // Step 2: 原有逻辑：本地 pop + steal
+    // 重要：break_early 只用于 finished / 超时等“真正退出”的条件
+    // =========================================================
+    if (job == nullptr) {
+      job = get_job([&]() { return finished(); }, PARLAY_ELASTIC_PARALLELISM);
     }
 
-    return false;
-};
+    if (job) {
+      (*job)();
+      continue;
+    }
 
-      // 如果信箱里没货（或者已经拿到了），走原有逻辑
-      if (job == nullptr) {
-          job = get_job(break_condition, PARLAY_ELASTIC_PARALLELISM);
-      }
-      // Job* job = get_job([&]() { return finished(); }, PARLAY_ELASTIC_PARALLELISM);
-      
-      
-      if (job)(*job)();
 #if PARLAY_ELASTIC_PARALLELISM
-      else if (!finished()) {
-        // If no job was stolen, the worker should go to
-        // sleep and wait until more work is available
+    if (!finished()) {
+      // 睡前再强检查一次 mailbox，避免“刚投递就睡死”的 race
+      if (Job* mb = try_take_mailbox()) {
+        (*mb)();
+      } else {
         wait_for_work();
       }
-#endif
     }
-    assert(finished());
-    num_finished_workers.fetch_add(1);
+#endif
   }
+
+  assert(finished());
+  num_finished_workers.fetch_add(1);
+}
+
 public:
   // Runs tasks until done(), stealing work if necessary.
   //
@@ -325,80 +326,101 @@ private:
   //   return nullptr;
   // }
 
-// 【修正版】两阶段 Stealing 策略
-  template<typename F>
-  Job* steal_job(F&& break_early, bool timeout) {
-    size_t worker_id = worker_info.worker_id;
-    int my_node = worker_info.my_numa_node;
-    
-    const auto start_time = std::chrono::steady_clock::now();
+// 【方案A】在 steal_job 内部周期性抢占检查本 NUMA mailbox。
+// 语义：mailbox 一旦有活，直接取走并返回 job，而不是 break_early 退出。
+template <typename F>
+Job* steal_job(F&& break_early, bool timeout) {
+  size_t worker_id = worker_info.worker_id;
+  int my_node = worker_info.my_numa_node;
 
-    auto& local_range = topology.numa_worker_ranges[my_node];
-    size_t local_size = local_range.second - local_range.first;
-    
-    // 预先计算好基于 ID 的 Base Hash，避免循环里重复算
-    // 这是每个人独有的“指纹”
-    size_t my_id_hash = hash(worker_id);
+  const auto start_time = std::chrono::steady_clock::now();
 
-    constexpr size_t LOCAL_TRIAL_FACTOR = 10;
-    // 设定尝试次数
-    size_t local_trials = (local_size > 0) ? local_size : 0; 
-    local_trials *= LOCAL_TRIAL_FACTOR;
-    size_t global_trials = num_deques; 
-    global_trials*= YIELD_FACTOR;
+  auto& local_range = topology.numa_worker_ranges[my_node];
+  size_t local_size = local_range.second - local_range.first;
 
-    do {
-      // =========================================================
-      // Phase 1: Local NUMA Stealing
-      // =========================================================
-      if (local_size > 1) { 
-          for (size_t i = 0; i < local_trials; i++) {
-            if (break_early()) return nullptr;
+  // 每个 worker 独有的随机序列基
+  size_t my_id_hash = hash(worker_id);
 
-            // 【回归原版算法】 Hash(ID) + Hash(Val)
-            // 保证每个人生成的随机序列是完全正交的，不会因为进度追赶而撞车
-            size_t step_hash = hash(attempts[worker_id].val);
-            attempts[worker_id].val++; 
+  constexpr size_t LOCAL_TRIAL_FACTOR = 10;
+  size_t local_trials = (local_size > 0) ? local_size : 0;
+  local_trials *= LOCAL_TRIAL_FACTOR;
 
-            // Offset 也要足够随机
-            size_t offset = (my_id_hash + step_hash) % local_size;
-            size_t target = local_range.first + offset;
+  size_t global_trials = num_deques;
+  global_trials *= YIELD_FACTOR;
 
-            if (target == worker_id) continue; 
+  // -------- mailbox 抢占轮询：低开销 --------
+  auto try_take_mailbox = [&]() -> Job* {
+    auto& slot = root_job_slots[my_node].job;
+    if (slot.load(std::memory_order_relaxed) == nullptr) return nullptr;
+    return slot.exchange(nullptr, std::memory_order_acq_rel);
+  };
 
-            // 注意：这里调用的是修改后(接受target参数)的 try_steal
-            Job* job = try_steal(target);
-            if (job) return job;
-          }
-      }
+  // 每 64 次 steal attempt 检查一次 mailbox（可根据你 workload 调整）
+  constexpr size_t MAILBOX_POLL_MASK = 63;
+  size_t poll_ctr = 0;
 
-      // =========================================================
-      // Phase 2: Global Stealing
-      // =========================================================
-      for (size_t i = 0; i < global_trials; i++) {
+  auto poll_mailbox = [&]() -> Job* {
+    if (((++poll_ctr) & MAILBOX_POLL_MASK) == 0) {
+      return try_take_mailbox();
+    }
+    return nullptr;
+  };
+
+  // 一进来先看一次，降低投递->响应延迟
+  if (Job* mb = try_take_mailbox()) return mb;
+
+  do {
+    // =========================================================
+    // Phase 1: Local NUMA Stealing
+    // =========================================================
+    if (local_size > 1) {
+      for (size_t i = 0; i < local_trials; i++) {
         if (break_early()) return nullptr;
+
+        // 抢占：定期检查 mailbox，有就直接返回
+        if (Job* mb = poll_mailbox()) return mb;
 
         size_t step_hash = hash(attempts[worker_id].val);
         attempts[worker_id].val++;
 
-        // 全局随机：直接模 num_deques
-        size_t target = (my_id_hash + step_hash) % num_deques;
-        
+        size_t offset = (my_id_hash + step_hash) % local_size;
+        size_t target = local_range.first + offset;
+
         if (target == worker_id) continue;
 
-        Job* job = try_steal(target);
-        if (job) return job;
+        if (Job* job = try_steal(target)) return job;
       }
+    }
 
-      // =========================================================
-      // Sleep Strategy
-      // =========================================================
-      std::this_thread::sleep_for(std::chrono::nanoseconds(num_deques * 100));
+    // =========================================================
+    // Phase 2: Global Stealing
+    // =========================================================
+    for (size_t i = 0; i < global_trials; i++) {
+      if (break_early()) return nullptr;
 
-    } while (!timeout || std::chrono::steady_clock::now() - start_time < STEAL_TIMEOUT);
-    
-    return nullptr;
-  }
+      if (Job* mb = poll_mailbox()) return mb;
+
+      size_t step_hash = hash(attempts[worker_id].val);
+      attempts[worker_id].val++;
+
+      size_t target = (my_id_hash + step_hash) % num_deques;
+      if (target == worker_id) continue;
+
+      if (Job* job = try_steal(target)) return job;
+    }
+
+    // =========================================================
+    // Sleep Strategy: 睡前强检查 mailbox，避免 race
+    // =========================================================
+    if (Job* mb = try_take_mailbox()) return mb;
+
+    std::this_thread::sleep_for(std::chrono::nanoseconds(num_deques * 100));
+
+  } while (!timeout || std::chrono::steady_clock::now() - start_time < STEAL_TIMEOUT);
+
+  return nullptr;
+}
+
 // 必须配合修改 try_steal
   Job* try_steal(size_t target) {
     // 这里的 target 是外面算好的，这里只管偷
