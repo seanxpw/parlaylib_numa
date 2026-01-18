@@ -119,7 +119,7 @@ struct scheduler {
     topology.build(num_threads);
     
     // Optional: Print topology info for verification
-    // topology.print_info();
+    topology.print_info();
     root_job_slots = std::make_unique<RootJobSlot[]>(topology.num_numa_nodes);
     // 2. Pin the main thread
     topology.pin_thread(0);
@@ -198,11 +198,13 @@ struct scheduler {
     size_t val;
   };
 
+  public:
   internal::Topology topology;
   struct alignas(64) RootJobSlot {
     std::atomic<Job*> job{nullptr};
   };
   std::unique_ptr<RootJobSlot[]> root_job_slots;
+  private:
   int num_deques;
   std::atomic<size_t> num_awake_workers;
   workerInfo parent_worker_info;
@@ -225,6 +227,7 @@ struct scheduler {
 int my_node = worker_info.my_numa_node;
 while (!finished()) {
       Job* job = nullptr;
+      // printf("Worker %u (NUMA Node %d) checking root job slot...\n", worker_info.worker_id, my_node);
       // =========================================================
       // 【新增】 Step 3: 优先检查 NUMA Root 信箱 (Take & Clear)
       // =========================================================
@@ -233,10 +236,26 @@ while (!finished()) {
           // 2. 原子获取 (Acquire exchange)
           job = root_job_slots[my_node].job.exchange(nullptr, std::memory_order_acquire);
       }
+      // 这里的 counter 是局部变量，Lambda 需要 mutable 才能修改它
+int loop_counter = 0; 
+
+auto break_condition = [&, loop_counter]() mutable {
+    // 1. 每次都检查全局结束标志 (finished通常实现很轻)
+    if (finished()) return true;
+
+    // 2. 采样检查：每 64 次循环才去读一次原子变量
+    // 使用位运算 (counter & 63) 比取模 (% 64) 快得多
+    if ((++loop_counter & 63) == 0) {
+        // 只有这里才会产生 load 开销
+        return root_job_slots[my_node].job.load(std::memory_order_relaxed) != nullptr;
+    }
+
+    return false;
+};
 
       // 如果信箱里没货（或者已经拿到了），走原有逻辑
       if (job == nullptr) {
-          job = get_job([&]() { return finished(); }, PARLAY_ELASTIC_PARALLELISM);
+          job = get_job(break_condition, PARLAY_ELASTIC_PARALLELISM);
       }
       // Job* job = get_job([&]() { return finished(); }, PARLAY_ELASTIC_PARALLELISM);
       
@@ -253,7 +272,7 @@ while (!finished()) {
     assert(finished());
     num_finished_workers.fetch_add(1);
   }
-
+public:
   // Runs tasks until done(), stealing work if necessary.
   //
   // Does not sleep or time out since this can be called
@@ -270,7 +289,7 @@ while (!finished()) {
     }
     assert(done());
   }
-
+private:
   // Find a job, first trying local stack, then random steals.
   //
   // Returns nullptr if break_early() returns true before a job
@@ -402,7 +421,7 @@ while (!finished()) {
 //   }
 
 #if PARLAY_ELASTIC_PARALLELISM
-
+public:
   // Wakes up at least one sleeping worker (more than one
   // worker may be woken up depending on the implementation).
   void wake_up_a_worker() {
@@ -426,7 +445,7 @@ while (!finished()) {
     parlay::atomic_wait(&wake_up_counter, wake_up_counter.load());
     num_awake_workers.fetch_add(1);
   }
-
+private:
 #endif
 
   size_t hash(uint64_t x) {
@@ -472,7 +491,11 @@ template <typename F>
         parfor(scheduler, start, end, std::forward<F>(f), granularity);
         return;
     }
-
+  if (granularity == 0) {
+      size_t done = get_granularity(start, end, f);
+      granularity = std::max(done, (end - start) / static_cast<size_t>(128 * scheduler.num_threads));
+      start += done;
+    }
     size_t nodes = scheduler.topology.num_numa_nodes;
     size_t chunk_size = (end - start) / nodes;
     
