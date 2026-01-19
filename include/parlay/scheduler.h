@@ -119,7 +119,7 @@ struct scheduler {
     topology.build(num_threads);
     
     // Optional: Print topology info for verification
-    // topology.print_info();
+    topology.print_info();
     root_job_slots = std::make_unique<RootJobSlot[]>(topology.num_numa_nodes);
     // 2. Pin the main thread
     topology.pin_thread(0);
@@ -204,7 +204,6 @@ struct scheduler {
     std::atomic<Job*> job{nullptr};
   };
   std::unique_ptr<RootJobSlot[]> root_job_slots;
-  alignas(64) std::atomic<bool> strict_numa_mode {false};
   private:
   int num_deques;
   std::atomic<size_t> num_awake_workers;
@@ -326,63 +325,67 @@ private:
   //   } while (!timeout || std::chrono::steady_clock::now() - start_time < STEAL_TIMEOUT);
   //   return nullptr;
   // }
+
+// 【方案A】在 steal_job 内部周期性抢占检查本 NUMA mailbox。
+// 语义：mailbox 一旦有活，直接取走并返回 job，而不是 break_early 退出。
 template <typename F>
 Job* steal_job(F&& break_early, bool timeout) {
   size_t worker_id = worker_info.worker_id;
   int my_node = worker_info.my_numa_node;
+
   const auto start_time = std::chrono::steady_clock::now();
 
   auto& local_range = topology.numa_worker_ranges[my_node];
   size_t local_size = local_range.second - local_range.first;
+
+  // 每个 worker 独有的随机序列基
   size_t my_id_hash = hash(worker_id);
 
-  // 基础参数配置
-  constexpr size_t LOCAL_TRIAL_FACTOR = 1000;
-  size_t base_local_trials = (local_size > 0) ? local_size * LOCAL_TRIAL_FACTOR : 0;
-  size_t base_global_trials = num_deques * YIELD_FACTOR; 
+  constexpr size_t LOCAL_TRIAL_FACTOR = 200;
+  size_t local_trials = (local_size > 0) ? local_size : 0;
+  local_trials *= LOCAL_TRIAL_FACTOR;
 
-  // Mailbox 检查 helper
+  size_t global_trials = num_deques;
+  global_trials *= YIELD_FACTOR;
+
+  // -------- mailbox 抢占轮询：低开销 --------
   auto try_take_mailbox = [&]() -> Job* {
     auto& slot = root_job_slots[my_node].job;
-    // 只有非空才去 exchange，节省总线带宽
     if (slot.load(std::memory_order_relaxed) == nullptr) return nullptr;
     return slot.exchange(nullptr, std::memory_order_acq_rel);
   };
 
-  // 带频率限制的 Mailbox Polling (例如每 64 次)
-  constexpr size_t CHECK_MASK = 63;
+  // 每 64 次 steal attempt 检查一次 mailbox（可根据你 workload 调整）
+  constexpr size_t MAILBOX_POLL_MASK = 63;
   size_t poll_ctr = 0;
+
   auto poll_mailbox = [&]() -> Job* {
-    if (((++poll_ctr) & CHECK_MASK) == 0) return try_take_mailbox();
+    if (((++poll_ctr) & MAILBOX_POLL_MASK) == 0) {
+      return try_take_mailbox();
+    }
     return nullptr;
   };
 
-  // 入口检查
+  // 一进来先看一次，降低投递->响应延迟
   if (Job* mb = try_take_mailbox()) return mb;
 
   do {
-    // 1. 获取当前模式状态
-    bool strict_mode = strict_numa_mode.load(std::memory_order_relaxed);
-
-    // 2. 根据状态设定尝试次数
-    // 如果 strict_mode，本地尝试次数翻倍(或更多)，牢牢锁死在本地
-    size_t cur_local_trials = strict_mode ? (base_local_trials * 10) : base_local_trials;
-    // 如果 strict_mode，逻辑上 global 为 0
-    size_t cur_global_trials = strict_mode ? 0 : base_global_trials;
-
     // =========================================================
     // Phase 1: Local NUMA Stealing
     // =========================================================
     if (local_size > 1) {
-      for (size_t i = 0; i < cur_local_trials; i++) {
+      for (size_t i = 0; i < local_trials; i++) {
         if (break_early()) return nullptr;
-        
-        // Phase 1 里不需要太频繁检查 strict_mode，因为我们本来就在正确的地方
+
+        // 抢占：定期检查 mailbox，有就直接返回
         if (Job* mb = poll_mailbox()) return mb;
 
         size_t step_hash = hash(attempts[worker_id].val);
         attempts[worker_id].val++;
-        size_t target = local_range.first + ((my_id_hash + step_hash) % local_size);
+
+        size_t offset = (my_id_hash + step_hash) % local_size;
+        size_t target = local_range.first + offset;
+
         if (target == worker_id) continue;
 
         if (Job* job = try_steal(target)) return job;
@@ -392,48 +395,31 @@ Job* steal_job(F&& break_early, bool timeout) {
     // =========================================================
     // Phase 2: Global Stealing
     // =========================================================
-    for (size_t i = 0; i < cur_global_trials; i++) {
-      if (break_early()) return nullptr;
+    // for (size_t i = 0; i < global_trials; i++) {
+    //   if (break_early()) return nullptr;
 
-      // 【修正 1】每次迭代都检查全局标志位
-      // 相比 try_steal (跨 Socket 原子操作)，这个 load (本地 L1 cache) 开销极小
-      if (strict_numa_mode.load(std::memory_order_relaxed)) {
-          // 【修正 2】发现戒严令！
-          // 更新本地状态，确保退出循环后不会去 sleep
-          strict_mode = true; 
-          break; // 立即跳出 Global 循环
-      }
+    //   if (Job* mb = poll_mailbox()) return mb;
 
-      if (Job* mb = poll_mailbox()) return mb;
+    //   size_t step_hash = hash(attempts[worker_id].val);
+    //   attempts[worker_id].val++;
 
-      size_t step_hash = hash(attempts[worker_id].val);
-      attempts[worker_id].val++;
-      size_t target = (my_id_hash + step_hash) % num_deques;
-      if (target == worker_id) continue;
+    //   size_t target = (my_id_hash + step_hash) % num_deques;
+    //   if (target == worker_id) continue;
 
-      if (Job* job = try_steal(target)) return job;
-    }
+    //   if (Job* job = try_steal(target)) return job;
+    // }
 
     // =========================================================
-    // Sleep Strategy
+    // Sleep Strategy: 睡前强检查 mailbox，避免 race
     // =========================================================
     if (Job* mb = try_take_mailbox()) return mb;
 
-    // 【修正 3】使用更新后的 strict_mode 进行判断
-    if (strict_mode) {
-        // 如果处于戒严模式，绝对不能 sleep，必须立刻 yield 并开始新一轮 Phase 1
-        std::this_thread::yield();
-        continue; // 直接跳转到 do-while 的 condition check，然后回到顶部
-    }
-
-    // 只有在非 strict 模式且真的一无所获时，才 sleep
     std::this_thread::sleep_for(std::chrono::nanoseconds(num_deques * 100));
 
   } while (!timeout || std::chrono::steady_clock::now() - start_time < STEAL_TIMEOUT);
 
   return nullptr;
 }
-
 
 // 必须配合修改 try_steal
   Job* try_steal(size_t target) {
@@ -562,41 +548,7 @@ template <typename F>
 
     // 唤醒所有 Worker
     scheduler.wake_up_all_workers();
-// =========================================================
-    // 【修改 2】：Wait for Pickup (握手确认)
-    // =========================================================
-    bool all_picked_up = false;
-    while (!all_picked_up) {
-        all_picked_up = true;
-        for (size_t i = 0; i < nodes; ++i) {
-            // 只要还有一个信箱没空，就说明有人还在路上
-            if (scheduler.root_job_slots[i].job.load(std::memory_order_relaxed) != nullptr) {
-                all_picked_up = false;
-                break;
-            }
-        }
-        if (!all_picked_up) {
-            std::this_thread::yield(); 
-        }
-    }
 
-    // =========================================================
-    // 【修改 3】：Wait for Expansion (公告多留一会儿)
-    // =========================================================
-    // 即使信箱空了，Worker 拿到任务也需要微秒级的时间去生成子任务放入本地 Deque。
-    // 如果我们现在立刻取消 strict 模式，其他迟钝的 Worker 可能会因为看到 Deque 暂时为空而跑去 Global。
-    // 所以，我们强制保持 strict 模式一小会儿（例如 10-20 微秒）。
-    // 这段时间足够 T0 把任务切分好并 Push 进去了。
-    auto wait_start = std::chrono::steady_clock::now();
-    while(std::chrono::steady_clock::now() - wait_start < std::chrono::microseconds(50)) {
-         // 忙等待，确保精确延迟
-         // 如果有 _mm_pause() 更好，没有就 yield
-         std::this_thread::yield(); 
-    }
-
-    // 【修改 4】：解除警报
-    // 现在大家应该都在本地找到活干了，恢复负载均衡机制
-    scheduler.strict_numa_mode.store(false, std::memory_order_release);
     // 主线程阻塞等待所有 Root Job 完成
     auto all_done = [&]() {
       for (const auto& job : root_jobs) {
